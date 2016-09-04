@@ -1,5 +1,6 @@
 /*
- * drivers/amlogic/reg_access/reg_access.c
+ * drivers/amlogic/smc_access/smc_access.c
+ * github.com/frederic/smc_access
  *
  * Copyright (C) 2015 Amlogic, Inc. All rights reserved.
  *
@@ -30,60 +31,19 @@
 #include <linux/debugfs.h>
 #include <linux/io.h>
 #include <linux/uaccess.h>
-static struct dentry *debugfs_root;
-/* amlogic debug device*/
-struct aml_ddev {
-	unsigned			cached_reg_addr;
-	unsigned			size;
-	int (*debugfs_reg_access)(struct aml_ddev *indio_dev,
-				 unsigned reg, unsigned writeval,
-				 unsigned *readval);
-};
-int aml_reg_access(struct aml_ddev *indio_dev,
-				 unsigned reg, unsigned writeval,
-				 unsigned *readval)
-{
-	void __iomem *vaddr;
-	reg = round_down(reg, 0x3);
-	vaddr = ioremap(reg, 0x4);
 
-	if (readval)
-		*readval = readl(vaddr);
-	else
-		writel(writeval, vaddr);
-	iounmap(vaddr);
-	return 0;
-}
-static struct aml_ddev aml_dev;
-static ssize_t paddr_read_file(struct file *file, char __user *userbuf,
-				 size_t count, loff_t *ppos)
-{
-	struct aml_ddev *indio_dev = file->private_data;
-	char buf[80];
-	unsigned val = 0;
-	ssize_t len;
-	int ret;
+static struct dentry *debugfs_root = NULL;
 
-	ret = indio_dev->debugfs_reg_access(indio_dev,
-						  indio_dev->cached_reg_addr,
-						  0, &val);
-	if (ret)
-		pr_err("%s: read failed\n", __func__);
-
-	len = snprintf(buf, sizeof(buf), "[0x%x] = 0x%X\n",
-		       indio_dev->cached_reg_addr, val);
-
-	return simple_read_from_buffer(userbuf, count, ppos, buf, len);
-
-}
-
-static ssize_t paddr_write_file(struct file *file, const char __user *userbuf,
+static ssize_t smc_write_file(struct file *file, const char __user *userbuf,
 				   size_t count, loff_t *ppos)
 {
-	struct aml_ddev *indio_dev = file->private_data;
-	unsigned reg, val;
+	register uint64_t x0 asm("x0") = 0;
+	register uint64_t x1 asm("x1") = 0;
+	register uint64_t x2 asm("x2") = 0;
+	register uint64_t x3 asm("x3") = 0;
+	register uint64_t x4 asm("x4") = 0;
 	char buf[80];
-	int ret;
+	uint64_t arg0, arg1, arg2, arg3, arg4;
 
 	count = min_t(size_t, count, (sizeof(buf)-1));
 	if (copy_from_user(buf, userbuf, count))
@@ -91,120 +51,74 @@ static ssize_t paddr_write_file(struct file *file, const char __user *userbuf,
 
 	buf[count] = 0;
 
-	ret = sscanf(buf, "%x %x", &reg, &val);
+	sscanf(buf, "%llx %llx %llx %llx %llx", &arg0, &arg1, &arg2, &arg3, &arg4);
+	
+	x0 = arg0;
+	x1 = arg1;
+	x2 = arg2;
+	x3 = arg3;
+	x4 = arg4;
+	
+	asm __volatile__("" : : : "memory");
 
-	switch (ret) {
-	case 1:
-		indio_dev->cached_reg_addr = reg;
-		break;
-	case 2:
-		indio_dev->cached_reg_addr = reg;
-		ret = indio_dev->debugfs_reg_access(indio_dev, reg,
-							  val, NULL);
-		if (ret) {
-			pr_err("%s: write failed\n", __func__);
-			return ret;
-		}
-		break;
-	default:
-		return -EINVAL;
-	}
+	do {
+		asm volatile(
+		    __asmeq("%0", "x0")
+		    __asmeq("%1", "x0")
+		    __asmeq("%2", "x1")
+		    __asmeq("%3", "x2")
+		    __asmeq("%4", "x3")
+		    __asmeq("%5", "x4")
+		    "smc #0\n"
+		    : "=r"(x0)
+		    : "r"(x0), "r"(x1), "r"(x2),"r"(x3),"r"(x4));
+	} while (0);
+	
+	arg1 = x0;
+	
+	printk(KERN_ALERT "smc_access: SMC call %llx returns: %llx\n", arg0, arg1);
 
 	return count;
 }
 
-static const struct file_operations paddr_file_ops = {
+static const struct file_operations smc_file_ops = {
+	.owner		= THIS_MODULE,
 	.open		= simple_open,
-	.read		= paddr_read_file,
-	.write		= paddr_write_file,
+	.write		= smc_write_file,
 };
 
-
-static ssize_t dump_write_file(struct file *file, const char __user *userbuf,
-				   size_t count, loff_t *ppos)
+static int __init smc_access_init(void)
 {
-	struct seq_file *s = file->private_data;
-	struct aml_ddev *indio_dev = s->private;
-	unsigned reg, val;
-	char buf[80];
-	int ret;
-	count = min_t(size_t, count, (sizeof(buf)-1));
-	if (copy_from_user(buf, userbuf, count))
-		return -EFAULT;
-
-	buf[count] = 0;
-
-	ret = sscanf(buf, "%x %i", &reg, &val);
-	switch (ret) {
-	case 2:
-		indio_dev->cached_reg_addr = reg;
-		indio_dev->size = val;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return count;
-}
-
-static int dump_show(struct seq_file *s, void *what)
-{
-	unsigned int  i = 0 , val;
-	int ret;
-	struct aml_ddev *indio_dev = s->private;
-
-	for (i = 0; i < indio_dev->size ; i++) {
-		ret = indio_dev->debugfs_reg_access(indio_dev,
-				  indio_dev->cached_reg_addr,
-				  0, &val);
-		if (ret)
-			pr_err("%s: read failed\n", __func__);
-
-		seq_printf(s, "[0x%x] = 0x%X\n",
-			   indio_dev->cached_reg_addr, val);
-		indio_dev->cached_reg_addr += 4;
-	}
-	return 0;
-}
-
-static int dump_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, dump_show, inode->i_private);
-}
-
-
-static const struct file_operations dump_file_ops = {
-	.open		= dump_open,
-	.read		= seq_read,
-	.write		= dump_write_file,
-	.llseek		= seq_lseek,
-};
-static int __init aml_debug_init(void)
-{
-	debugfs_root = debugfs_create_dir("aml_reg", NULL);
+	struct dentry *debugfs_file;
+	
+	debugfs_root = debugfs_create_dir("aml_smc", NULL);
 	if (IS_ERR(debugfs_root) || !debugfs_root) {
-		pr_warn("failed to create debugfs directory\n");
+		pr_warn("smc_access: failed to create smc_access debugfs directory\n");
 		debugfs_root = NULL;
 		return -1;
 	}
-	aml_dev.debugfs_reg_access = aml_reg_access;
 
-	debugfs_create_file("paddr", S_IFREG | S_IRUGO,
-			    debugfs_root, &aml_dev, &paddr_file_ops);
-	debugfs_create_file("dump", S_IFREG | S_IRUGO,
-			    debugfs_root, &aml_dev, &dump_file_ops);
+	debugfs_file = debugfs_create_file("smc", S_IFREG | S_IRUGO,
+			    debugfs_root, NULL, &smc_file_ops);
+	if (!debugfs_file) {
+		printk(KERN_ALERT "smc_access: failed to create smc_access debugfs file\n");
+		return -1;
+    }
+    
 	return 0;
 }
 
-static void __exit aml_debug_exit(void)
+static void __exit smc_access_exit(void)
 {
+	printk(KERN_ALERT "smc_access: exiting...\n");
+	if(debugfs_root)
+		debugfs_remove_recursive(debugfs_root);
 }
 
 
-module_init(aml_debug_init);
-module_exit(aml_debug_exit);
+module_init(smc_access_init);
+module_exit(smc_access_exit);
 
-MODULE_DESCRIPTION("Amlogic debug module");
+MODULE_DESCRIPTION("SMC module");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Xing Xu <xing.xu@amlogic.com>");
-
